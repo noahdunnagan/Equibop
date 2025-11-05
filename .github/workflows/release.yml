@@ -36,12 +36,9 @@ jobs:
       - name: Build
         run: bun run build
 
-      - name: Run Electron Builder
+      - name: Run Electron Builder (sign only)
         run: |
-          bunx electron-builder --mac --publish always
+          bunx electron-builder --mac --publish always --config.mac.notarize=false
         env:
           CSC_KEYCHAIN: build.keychain
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
