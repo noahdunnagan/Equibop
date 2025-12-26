@@ -33,6 +33,7 @@ import { getArRPCStatus } from "./arrpc";
 import { autoStart } from "./autoStart";
 import { VENCORD_QUICKCSS_FILE, VENCORD_THEMES_DIR } from "./constants";
 import { AppEvents } from "./events";
+import { getPlatformSpoofInfo } from "./gnuSpoofing";
 import { mainWin } from "./mainWindow";
 import { Settings, State } from "./settings";
 import { handle, handleSync } from "./utils/ipcWrappers";
@@ -41,11 +42,23 @@ import { isDeckGameMode, showGamePage } from "./utils/steamOS";
 import { isValidVencordInstall } from "./utils/vencordLoader";
 import { VENCORD_DIR } from "./vencordDir";
 
-handleSync(IpcEvents.GET_VENCORD_PRELOAD_FILE, () => join(VENCORD_DIR, "preload.js"));
+handleSync(IpcEvents.DEPRECATED_GET_VENCORD_PRELOAD_SCRIPT_PATH, () => join(VENCORD_DIR, "preload.js"));
+handleSync(IpcEvents.GET_VENCORD_PRELOAD_SCRIPT, () => readFileSync(join(VENCORD_DIR, "preload.js"), "utf-8"));
 handleSync(IpcEvents.GET_VENCORD_RENDERER_SCRIPT, () => readFileSync(join(VENCORD_DIR, "renderer.js"), "utf-8"));
 
-handleSync(IpcEvents.GET_RENDERER_SCRIPT, () => readFileSync(join(__dirname, "renderer.js"), "utf-8"));
-handleSync(IpcEvents.GET_RENDERER_CSS_FILE, () => join(__dirname, "renderer.css"));
+const VESKTOP_RENDERER_JS_PATH = join(__dirname, "renderer.js");
+const VESKTOP_RENDERER_CSS_PATH = join(__dirname, "renderer.css");
+handleSync(IpcEvents.GET_VESKTOP_RENDERER_SCRIPT, () => readFileSync(VESKTOP_RENDERER_JS_PATH, "utf-8"));
+handle(IpcEvents.GET_VESKTOP_RENDERER_CSS, () => readFile(VESKTOP_RENDERER_CSS_PATH, "utf-8"));
+
+if (IS_DEV) {
+    watch(VESKTOP_RENDERER_CSS_PATH, { persistent: false }, async () => {
+        mainWin?.webContents.postMessage(
+            IpcEvents.VESKTOP_RENDERER_CSS_UPDATE,
+            await readFile(VESKTOP_RENDERER_CSS_PATH, "utf-8")
+        );
+    });
+}
 
 handleSync(IpcEvents.GET_SETTINGS, () => Settings.plain);
 handleSync(IpcEvents.GET_VERSION, () => app.getVersion());
@@ -62,6 +75,8 @@ handle(IpcEvents.ENABLE_AUTOSTART, autoStart.enable);
 handle(IpcEvents.DISABLE_AUTOSTART, autoStart.disable);
 
 handleSync(IpcEvents.ARRPC_GET_STATUS, () => getArRPCStatus());
+
+handleSync(IpcEvents.GET_PLATFORM_SPOOF_INFO, () => getPlatformSpoofInfo());
 
 handle(IpcEvents.SET_SETTINGS, (_, settings: typeof Settings.store, path?: string) => {
     Settings.setData(settings, path);
@@ -146,6 +161,11 @@ handle(IpcEvents.SELECT_VENCORD_DIR, async (_e, value?: null) => {
 });
 
 handle(IpcEvents.SET_BADGE_COUNT, (_, count: number) => setBadgeCount(count));
+
+handle(IpcEvents.FLASH_FRAME, (_, flag: boolean) => {
+    if (!mainWin || mainWin.isDestroyed() || (flag && mainWin.isFocused())) return;
+    mainWin.flashFrame(flag);
+});
 
 handle(IpcEvents.CLIPBOARD_COPY_IMAGE, async (_, buf: ArrayBuffer, src: string) => {
     clipboard.write({

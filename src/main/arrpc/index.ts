@@ -5,9 +5,13 @@
  */
 
 import { ChildProcess, spawn } from "child_process";
+import { app } from "electron";
 import { accessSync, constants, existsSync, statSync } from "fs";
-import { join, resolve } from "path";
+import { join } from "path";
+import { IpcEvents } from "shared/IpcEvents";
+import { STATIC_DIR } from "shared/paths";
 
+import { mainWin } from "../mainWindow";
 import { Settings } from "../settings";
 
 interface ArRPCStreamerModeMessage {
@@ -87,8 +91,10 @@ function getArRPCBinaryPath(): string {
     const { arch } = process;
 
     const platformName = platform === "win32" ? "windows" : platform;
+
     let binaryName = `arrpc-${platformName}-${arch}`;
     if (platform === "win32") binaryName += ".exe";
+    if (app.isPackaged) binaryName = platform === "win32" ? "arrpc.exe" : "arrpc";
 
     debugLog(`Looking for arRPC binary for platform=${platform}, arch=${arch}`);
 
@@ -123,23 +129,26 @@ function getArRPCBinaryPath(): string {
         }
     }
 
-    debugLog("No bundled arRPC binary found, trying alternative paths");
+    if (STATIC_DIR.includes(".asar")) {
+        const asarDir = STATIC_DIR.split(".asar")[0] + ".asar";
+        const asarParent = join(asarDir, "..");
+        const systemPath = join(asarParent, "arrpc", binaryName);
+        debugLog(`Checking system Electron path: ${systemPath}`);
 
-    const devPath = resolve(__dirname, "..", "..", "resources", "arrpc", binaryName);
+        if (checkBinary(systemPath)) {
+            debugLog(`Found arRPC binary at system path: ${systemPath}`);
+            return systemPath;
+        }
+    }
+
+    const devPath = join(STATIC_DIR, "dist", binaryName);
     debugLog(`Checking dev path: ${devPath}`);
     if (checkBinary(devPath)) {
         debugLog(`Found arRPC binary at dev path: ${devPath}`);
         return devPath;
     }
 
-    const asarPath = resolve(__dirname.replace(/app\.asar.*$/, ""), "arrpc", binaryName);
-    debugLog(`Checking asar-relative path: ${asarPath}`);
-    if (checkBinary(asarPath)) {
-        debugLog(`Found arRPC binary at asar-relative path: ${asarPath}`);
-        return asarPath;
-    }
-
-    throw new Error(`arRPC binary not found for ${platformName}-${arch}. Tried: ${devPath}, ${asarPath}`);
+    throw new Error(`arRPC binary not found for ${platformName}-${arch}. Tried: ${devPath}`);
 }
 
 let arrpcProcess: ChildProcess | null = null;
@@ -152,7 +161,8 @@ let readyTime: number | null = null;
 let restartCount: number = 0;
 let binaryPath: string | null = null;
 let isReady: boolean = false;
-let settingsListener: (() => void) | null = null;
+let mainSettingsListener: (() => void) | null = null;
+let configSettingsListener: (() => void) | null = null;
 let stderrBuffer: string = "";
 let initTimeout: NodeJS.Timeout | null = null;
 let isDestroying: boolean = false;
@@ -292,6 +302,7 @@ function handleArRPCMessage(message: ArRPCMessage) {
             readyTime = Date.now();
             clearInitTimeout();
             debugLog(`arRPC ready, version: ${message.data.version}`);
+            mainWin?.webContents.send(IpcEvents.ARRPC_READY);
             break;
         }
 
@@ -303,6 +314,7 @@ function handleArRPCMessage(message: ArRPCMessage) {
 
         case "STREAMERMODE": {
             debugLog(`Streamer mode changed: ${message.data}`);
+            mainWin?.webContents.send(IpcEvents.STREAMER_MODE_DETECTED, message.data);
             break;
         }
     }
@@ -334,7 +346,7 @@ function processStderrData(data: string) {
 }
 
 export async function initArRPC() {
-    if (!Settings.store.arRPC) {
+    if (Settings.store.arRPCDisabled || !Settings.store.arRPC) {
         debugLog("arRPC is disabled in settings, destroying if running");
         await destroyArRPC();
         restartCount = 0;
@@ -354,48 +366,31 @@ export async function initArRPC() {
     try {
         const resolvedBinaryPath = getArRPCBinaryPath();
 
-        let dataDir: string;
-        const binaryDir = resolve(resolvedBinaryPath, "..");
-        const detectableFile = "detectable.json";
-
-        if (existsSync(join(binaryDir, detectableFile))) {
-            dataDir = binaryDir;
-        } else if (process.resourcesPath) {
-            const prodDataDir = join(process.resourcesPath, "arrpc");
-            if (existsSync(join(prodDataDir, detectableFile))) {
-                dataDir = prodDataDir;
-            } else {
-                dataDir = resolve(__dirname, "..", "..", "resources", "arrpc");
-            }
-        } else {
-            dataDir = resolve(__dirname, "..", "..", "resources", "arrpc");
-        }
-
         debugLog("Initializing arRPC");
         debugLog(`Binary path: ${resolvedBinaryPath}`);
-        debugLog(`Data directory: ${dataDir}`);
-
-        if (!existsSync(dataDir)) {
-            throw new Error(`Data directory does not exist: ${dataDir}`);
-        }
-
-        const detectablePath = join(dataDir, detectableFile);
-        if (!existsSync(detectablePath)) {
-            throw new Error(`${detectableFile} not found in data directory: ${dataDir}`);
-        }
 
         binaryPath = resolvedBinaryPath;
 
-        const env = {
+        const env: NodeJS.ProcessEnv = {
             ...process.env,
-            ARRPC_DATA_DIR: dataDir,
             ARRPC_IPC_MODE: "1",
             ARRPC_PARENT_MONITOR: "1"
         };
 
+        if (Settings.store.arRPCDebug) {
+            env.ARRPC_DEBUG = "1";
+        }
+
+        if (Settings.store.arRPCProcessScanning === false) {
+            env.ARRPC_NO_PROCESS_SCANNING = "1";
+        }
+
+        if (Settings.store.arRPCBridge === false) {
+            env.ARRPC_NO_BRIDGE = "1";
+        }
+
         arrpcProcess = spawn(resolvedBinaryPath, [], {
             stdio: ["ignore", "pipe", "pipe"],
-            cwd: dataDir,
             env,
             windowsHide: true
         });
@@ -414,7 +409,7 @@ export async function initArRPC() {
 
         arrpcProcess.stdout?.on("data", data => {
             const output = data.toString().trim();
-            console.log("[arRPC]", output);
+            console.log(output);
         });
 
         arrpcProcess.stderr?.on("data", data => {
@@ -457,24 +452,45 @@ export async function initArRPC() {
 }
 
 export function setupArRPC() {
-    if (settingsListener) {
+    if (mainSettingsListener) {
         debugLog("arRPC already set up");
         return;
     }
 
-    settingsListener = () => {
+    mainSettingsListener = () => {
         initArRPC();
     };
 
-    Settings.addChangeListener("arRPC", settingsListener);
-    debugLog("arRPC settings listener registered");
+    configSettingsListener = () => {
+        if (arrpcProcess && Settings.store.arRPC) {
+            restartArRPC();
+        }
+    };
+
+    Settings.addChangeListener("arRPCDisabled", mainSettingsListener);
+    Settings.addChangeListener("arRPC", mainSettingsListener);
+    Settings.addChangeListener("arRPCDebug", configSettingsListener);
+    Settings.addChangeListener("arRPCProcessScanning", configSettingsListener);
+    Settings.addChangeListener("arRPCBridge", configSettingsListener);
+    debugLog("arRPC settings listeners registered");
 }
 
 export async function cleanupArRPC() {
-    if (settingsListener) {
-        Settings.removeChangeListener("arRPC", settingsListener);
-        settingsListener = null;
-        debugLog("arRPC settings listener removed");
+    if (mainSettingsListener) {
+        Settings.removeChangeListener("arRPCDisabled", mainSettingsListener);
+        Settings.removeChangeListener("arRPC", mainSettingsListener);
+        mainSettingsListener = null;
+    }
+
+    if (configSettingsListener) {
+        Settings.removeChangeListener("arRPCDebug", configSettingsListener);
+        Settings.removeChangeListener("arRPCProcessScanning", configSettingsListener);
+        Settings.removeChangeListener("arRPCBridge", configSettingsListener);
+        configSettingsListener = null;
+    }
+
+    if (mainSettingsListener === null && configSettingsListener === null) {
+        debugLog("arRPC settings listeners removed");
     }
 
     await destroyArRPC();

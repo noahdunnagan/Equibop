@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { Node } from "@vencord/venmic";
-import { ipcRenderer } from "electron";
-import { IpcMessage, IpcResponse } from "main/ipcCommands";
+import type { Node } from "@vencord/venmic";
+import { ipcRenderer } from "electron/renderer";
+import type { IpcMessage, IpcResponse } from "main/ipcCommands";
 import type { Settings } from "shared/settings";
 
 import { IpcEvents } from "../shared/IpcEvents";
@@ -27,6 +27,13 @@ ipcRenderer.on(IpcEvents.STREAMER_MODE_DETECTED, (_, data: string) => {
     streamerModeCallbacks.forEach(cb => cb(data));
 });
 
+type ArRPCReadyCallback = () => void;
+const arrpcReadyCallbacks = new Set<ArRPCReadyCallback>();
+
+ipcRenderer.on(IpcEvents.ARRPC_READY, () => {
+    arrpcReadyCallbacks.forEach(cb => cb());
+});
+
 let onDevtoolsOpen = () => {};
 let onDevtoolsClose = () => {};
 
@@ -43,7 +50,19 @@ export const VesktopNative = {
         supportsWindowsTransparency: () => sendSync<boolean>(IpcEvents.SUPPORTS_WINDOWS_TRANSPARENCY),
         getEnableHardwareAcceleration: () => sendSync<boolean>(IpcEvents.GET_ENABLE_HARDWARE_ACCELERATION),
         isOutdated: () => invoke<boolean>(IpcEvents.UPDATER_IS_OUTDATED),
-        openUpdater: () => invoke<void>(IpcEvents.UPDATER_OPEN)
+        openUpdater: () => invoke<void>(IpcEvents.UPDATER_OPEN),
+        getPlatformSpoofInfo: () =>
+            sendSync<{
+                spoofed: boolean;
+                originalPlatform: string;
+                spoofedPlatform: string | null;
+            }>(IpcEvents.GET_PLATFORM_SPOOF_INFO),
+        getRendererCss: () => invoke<string>(IpcEvents.GET_VESKTOP_RENDERER_CSS),
+        onRendererCssUpdate: (cb: (newCss: string) => void) => {
+            if (!IS_DEV) return;
+
+            ipcRenderer.on(IpcEvents.VESKTOP_RENDERER_CSS_UPDATE, (_e, newCss: string) => cb(newCss));
+        }
     },
     autostart: {
         isEnabled: () => sendSync<boolean>(IpcEvents.AUTOSTART_ENABLED),
@@ -80,6 +99,12 @@ export const VesktopNative = {
         offStreamerModeDetected(cb: StreamerModeCallback) {
             streamerModeCallbacks.delete(cb);
         },
+        onReady(cb: ArRPCReadyCallback) {
+            arrpcReadyCallbacks.add(cb);
+        },
+        offReady(cb: ArRPCReadyCallback) {
+            arrpcReadyCallbacks.delete(cb);
+        },
         getStatus: () =>
             sendSync<{
                 running: boolean;
@@ -102,6 +127,7 @@ export const VesktopNative = {
         close: (key?: string) => invoke<void>(IpcEvents.CLOSE, key),
         minimize: (key?: string) => invoke<void>(IpcEvents.MINIMIZE, key),
         maximize: (key?: string) => invoke<void>(IpcEvents.MAXIMIZE, key),
+        flashFrame: (flag: boolean) => invoke<void>(IpcEvents.FLASH_FRAME, flag),
         setDevtoolsCallbacks: (onOpen: () => void, onClose: () => void) => {
             onDevtoolsOpen = onOpen;
             onDevtoolsClose = onClose;

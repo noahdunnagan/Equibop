@@ -5,6 +5,8 @@
  */
 
 import { app, BrowserWindow, Menu, NativeImage, nativeImage, Tray } from "electron";
+import { join } from "path";
+import { STATIC_DIR } from "shared/paths";
 
 import { createAboutWindow } from "./about";
 import { restartArRPC } from "./arrpc";
@@ -16,10 +18,29 @@ import { downloadVencordAsar } from "./utils/vencordLoader";
 
 type TrayVariant = "tray" | "trayUnread" | "traySpeaking" | "trayIdle" | "trayMuted" | "trayDeafened";
 
-let tray: Tray;
+const isLinux = process.platform === "linux";
+
+let nativeSNI: typeof import("libvesktop") | null = null;
+if (isLinux) {
+    try {
+        nativeSNI = require(join(STATIC_DIR, `dist/libvesktop-${process.arch}.node`));
+    } catch (e) {
+        console.warn("[Tray] Failed to load native StatusNotifierItem, falling back to Electron Tray:", e);
+    }
+}
+
+let tray: Tray | null = null;
 let trayVariant: TrayVariant = "tray";
+let onTrayClick: (() => void) | null = null;
+let trayUpdateTimeout: NodeJS.Timeout | null = null;
+let pendingTrayVariant: TrayVariant | null = null;
+let nativeTrayWindow: BrowserWindow | null = null;
+let nativeTrayUpdateCallback: (() => void) | null = null;
 
 const trayImageCache = new Map<string, NativeImage>();
+
+let useNativeTray = false;
+let nativeTrayInitialized = false;
 
 async function getCachedTrayImage(variant: TrayVariant): Promise<NativeImage> {
     const path = await resolveAssetPath(variant as UserAssetType);
@@ -33,39 +54,260 @@ async function getCachedTrayImage(variant: TrayVariant): Promise<NativeImage> {
     return image;
 }
 
-const userAssetChangedListener = async (asset: string) => {
-    if (tray && asset.startsWith("tray")) {
-        const path = await resolveAssetPath(trayVariant as UserAssetType);
-        trayImageCache.delete(path);
+function nativeImageToPixmap(image: NativeImage): Promise<Buffer> {
+    return new Promise(resolve => {
+        setImmediate(() => {
+            const resized = image.resize({ width: 32, height: 32 });
+            const size = resized.getSize();
+            const { width } = size;
+            const { height } = size;
 
-        const image = await getCachedTrayImage(trayVariant);
-        tray.setImage(image);
+            const bitmap = resized.toBitmap();
+
+            const pixmapSize = 8 + bitmap.length;
+            const pixmap = Buffer.allocUnsafe(pixmapSize);
+
+            pixmap.writeUInt32LE(width, 0);
+            pixmap.writeUInt32LE(height, 4);
+
+            for (let i = 0; i < bitmap.length; i += 4) {
+                const r = bitmap[i];
+                const g = bitmap[i + 1];
+                const b = bitmap[i + 2];
+                const a = bitmap[i + 3];
+
+                const alpha = a / 255;
+                const premultR = Math.round(r * alpha);
+                const premultG = Math.round(g * alpha);
+                const premultB = Math.round(b * alpha);
+
+                pixmap[8 + i] = a;
+                pixmap[8 + i + 1] = premultB;
+                pixmap[8 + i + 2] = premultG;
+                pixmap[8 + i + 3] = premultR;
+            }
+
+            resolve(pixmap);
+        });
+    });
+}
+
+const userAssetChangedListener = async (asset: string) => {
+    if (!asset.startsWith("tray")) return;
+
+    try {
+        if (useNativeTray && nativeSNI) {
+            trayImageCache.clear();
+            const image = await getCachedTrayImage(trayVariant);
+            const pixmap = await nativeImageToPixmap(image);
+            nativeSNI.setStatusNotifierIcon(pixmap);
+        } else if (tray) {
+            trayImageCache.clear();
+            const image = await getCachedTrayImage(trayVariant);
+            tray.setImage(image);
+        }
+    } catch (e) {
+        console.error("[Tray] Failed to update tray icon on asset change:", e);
     }
 };
 
-const setTrayVariantListener = async (variant: TrayVariant) => {
+async function updateTrayIconNative(variant: TrayVariant) {
     if (trayVariant === variant) return;
 
     trayVariant = variant;
-    if (!tray) return;
 
-    const image = await getCachedTrayImage(trayVariant);
-    tray.setImage(image);
+    try {
+        if (useNativeTray && nativeSNI) {
+            const image = await getCachedTrayImage(variant);
+            const pixmap = await nativeImageToPixmap(image);
+            nativeSNI.setStatusNotifierIcon(pixmap);
+        }
+    } catch (e) {
+        console.error("[Tray] Failed to update native tray icon:", e);
+    }
+}
+
+async function updateTrayIconElectron(variant: TrayVariant) {
+    if (!tray || trayVariant === variant) return;
+
+    trayVariant = variant;
+    try {
+        const image = await getCachedTrayImage(trayVariant);
+        tray.setImage(image);
+    } catch (e) {
+        console.error("[Tray] Failed to update Electron tray icon:", e);
+    }
+}
+
+const setTrayVariantListener = (variant: TrayVariant) => {
+    if (useNativeTray) {
+        updateTrayIconNative(variant);
+    } else {
+        pendingTrayVariant = variant;
+
+        if (trayUpdateTimeout) return;
+
+        updateTrayIconElectron(variant);
+
+        trayUpdateTimeout = setTimeout(() => {
+            trayUpdateTimeout = null;
+
+            if (pendingTrayVariant && pendingTrayVariant !== trayVariant) {
+                updateTrayIconElectron(pendingTrayVariant);
+            }
+            pendingTrayVariant = null;
+        }, 100);
+    }
 };
 
-AppEvents.on("userAssetChanged", userAssetChangedListener);
-AppEvents.on("setTrayVariant", setTrayVariantListener);
+if (!AppEvents.listeners("userAssetChanged").includes(userAssetChangedListener)) {
+    AppEvents.on("userAssetChanged", userAssetChangedListener);
+}
+
+if (!AppEvents.listeners("setTrayVariant").includes(setTrayVariantListener)) {
+    AppEvents.on("setTrayVariant", setTrayVariantListener);
+}
 
 export function destroyTray() {
     AppEvents.off("userAssetChanged", userAssetChangedListener);
     AppEvents.off("setTrayVariant", setTrayVariantListener);
-    tray?.destroy();
+
+    if (trayUpdateTimeout) {
+        clearTimeout(trayUpdateTimeout);
+        trayUpdateTimeout = null;
+    }
+    pendingTrayVariant = null;
+
+    if (useNativeTray && nativeSNI) {
+        try {
+            if (nativeTrayWindow && nativeTrayUpdateCallback) {
+                nativeTrayWindow.off("show", nativeTrayUpdateCallback);
+                nativeTrayWindow.off("hide", nativeTrayUpdateCallback);
+                nativeTrayWindow = null;
+                nativeTrayUpdateCallback = null;
+            }
+            nativeSNI.destroyStatusNotifierItem();
+            nativeTrayInitialized = false;
+        } catch (e) {
+            console.error("[Tray] Failed to destroy native StatusNotifierItem:", e);
+        }
+    }
+
+    if (tray) {
+        try {
+            if (onTrayClick) {
+                tray.removeListener("click", onTrayClick);
+                onTrayClick = null;
+            }
+            tray.destroy();
+        } catch (e) {
+            console.error("[Tray] Failed to destroy Electron tray:", e);
+        }
+        tray = null;
+    }
 
     trayImageCache.clear();
+    useNativeTray = false;
 }
 
 export async function initTray(win: BrowserWindow, setIsQuitting: (val: boolean) => void) {
-    const onTrayClick = () => {
+    if (tray || nativeTrayInitialized) {
+        try {
+            destroyTray();
+        } catch (e) {
+            console.error("[Tray] Failed to destroy existing tray during init:", e);
+        }
+    }
+
+    if (isLinux && nativeSNI) {
+        try {
+            const success = nativeSNI.initStatusNotifierItem();
+            if (success) {
+                useNativeTray = true;
+                nativeTrayInitialized = true;
+
+                const initialImage = await getCachedTrayImage(trayVariant);
+                const pixmap = await nativeImageToPixmap(initialImage);
+                nativeSNI.setStatusNotifierIcon(pixmap);
+                nativeSNI.setStatusNotifierTitle("Equibop");
+
+                const menuItems = [
+                    { id: 1, label: win.isVisible() ? "Hide" : "Open", enabled: true, visible: true },
+                    { id: 2, label: "About", enabled: true, visible: true },
+                    { id: 3, label: "Repair Equicord", enabled: true, visible: true },
+                    { id: 4, label: "Reset Equibop", enabled: true, visible: true },
+                    {
+                        id: 5,
+                        label: "Restart arRPC",
+                        enabled: true,
+                        visible: Settings.store.arRPC === true
+                    },
+                    { id: 6, type: "separator" as const, enabled: true, visible: true },
+                    { id: 7, label: "Restart", enabled: true, visible: true },
+                    { id: 8, label: "Quit", enabled: true, visible: true }
+                ];
+
+                const menuResult = nativeSNI.setStatusNotifierMenu(menuItems);
+
+                nativeTrayWindow = win;
+                nativeTrayUpdateCallback = () => {
+                    try {
+                        nativeSNI.updateStatusNotifierMenuItem(1, win.isVisible() ? "Hide" : "Open");
+                    } catch (e) {
+                        console.error("[Tray] Failed to update native menu item:", e);
+                    }
+                };
+
+                win.on("show", nativeTrayUpdateCallback);
+                win.on("hide", nativeTrayUpdateCallback);
+
+                nativeSNI.setStatusNotifierMenuClickCallback((id: number) => {
+                    switch (id) {
+                        case 1: // open/hide
+                            if (win.isVisible()) win.hide();
+                            else win.show();
+                            break;
+                        case 2: // about
+                            createAboutWindow();
+                            break;
+                        case 3: // repair equicord
+                            downloadVencordAsar().then(() => {
+                                app.relaunch();
+                                app.quit();
+                            });
+                            break;
+                        case 4: // reset Equibop
+                            clearData(win);
+                            break;
+                        case 5: // restart arRPC-bun
+                            restartArRPC();
+                            break;
+                        case 7: // restart
+                            app.relaunch();
+                            app.quit();
+                            break;
+                        case 8: // quit
+                            setIsQuitting(true);
+                            app.quit();
+                            break;
+                    }
+                });
+
+                nativeSNI.setStatusNotifierActivateCallback(() => {
+                    if (Settings.store.clickTrayToShowHide && win.isVisible()) win.hide();
+                    else win.show();
+                });
+
+                return;
+            }
+        } catch (e) {
+            console.warn("[Tray] Failed to initialize native StatusNotifierItem, falling back to Electron Tray:", e);
+        }
+    }
+
+    useNativeTray = false;
+
+    onTrayClick = () => {
         if (Settings.store.clickTrayToShowHide && win.isVisible()) win.hide();
         else win.show();
     };
@@ -121,9 +363,22 @@ export async function initTray(win: BrowserWindow, setIsQuitting: (val: boolean)
         }
     ]);
 
-    const initialImage = await getCachedTrayImage(trayVariant);
-    tray = new Tray(initialImage);
-    tray.setToolTip("Equibop");
-    tray.setContextMenu(trayMenu);
-    tray.on("click", onTrayClick);
+    try {
+        const initialImage = await getCachedTrayImage(trayVariant);
+        tray = new Tray(initialImage);
+        tray.setToolTip("Equibop");
+
+        if (isLinux) {
+            tray.on("click", onTrayClick);
+            tray.on("right-click", () => {
+                tray!.popUpContextMenu(trayMenu);
+            });
+        } else {
+            tray.setContextMenu(trayMenu);
+            tray.on("click", onTrayClick);
+        }
+    } catch (e) {
+        console.error("[Tray] Failed to initialize Electron tray:", e);
+        tray = null;
+    }
 }

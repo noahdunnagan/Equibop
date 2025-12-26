@@ -5,16 +5,13 @@
  */
 
 import { addContextMenuPatch } from "@equicord/types/api/ContextMenu";
-import { findStoreLazy } from "@equicord/types/webpack";
-import { FluxDispatcher, Menu, useMemo, useStateFromStores } from "@equicord/types/webpack/common";
+import { FluxDispatcher, Menu, SpellCheckStore, useMemo, useStateFromStores } from "@equicord/types/webpack/common";
 import { useSettings } from "renderer/settings";
 
 import { addPatch } from "./shared";
 
 let word: string;
 let corrections: string[];
-
-const SpellCheckStore = findStoreLazy("SpellcheckStore");
 
 // Make spellcheck suggestions work
 addPatch({
@@ -23,7 +20,7 @@ addPatch({
             find: ".enableSpellCheck)",
             replacement: {
                 // if (isDesktop) { DiscordNative.onSpellcheck(openMenu(props)) } else { e.preventDefault(); openMenu(props) }
-                match: /else (.{1,3})\.preventDefault\(\),(.{1,3}\(.{1,3}\))(?<=:(.{1,3})\.enableSpellCheck\).+?)/,
+                match: /else (\i)\.preventDefault\(\),(\i\(\i\))(?<=:(\i)\.enableSpellCheck\).+?)/,
                 // ... else { $self.onSlateContext(() => openMenu(props)) }
                 replace: "else {$self.onSlateContext($1, $3?.enableSpellCheck, () => $2)}"
             }
@@ -66,6 +63,7 @@ addContextMenuPatch("textarea-context", children => {
                 <>
                     {corrections.map(c => (
                         <Menu.MenuItem
+                            key={c}
                             id={"vcd-spellcheck-suggestion-" + c}
                             label={c}
                             action={() => VesktopNative.spellcheck.replaceMisspelling(c)}
@@ -95,6 +93,7 @@ addContextMenuPatch("textarea-context", children => {
                         const isEnabled = spellCheckLanguages.includes(lang);
                         return (
                             <Menu.MenuCheckboxItem
+                                key={lang}
                                 id={"vcd-spellcheck-lang-" + lang}
                                 label={lang}
                                 checked={isEnabled}

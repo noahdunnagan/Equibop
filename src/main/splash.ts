@@ -29,6 +29,7 @@ export async function createSplashWindow(startMinimized = false) {
         }
     });
 
+    splash.webContents.setMaxListeners(15);
     loadView(splash, "splash.html");
 
     const { splashBackground, splashColor, splashTheming, splashProgress, splashPixelated } = Settings.store;
@@ -44,10 +45,6 @@ export async function createSplashWindow(startMinimized = false) {
         if (splashBackground) {
             splash.webContents.insertCSS(`body { --bg: ${splashBackground} !important }`);
         }
-    }
-
-    if (splashPixelated) {
-        splash.webContents.insertCSS(`img { image-rendering: pixelated; }`);
     }
 
     if (splashPixelated) {
